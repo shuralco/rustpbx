@@ -1339,6 +1339,9 @@ impl CallModule {
             if let Some(ice_lite) = hints.ice_lite.take() {
                 dialplan.media.ice_lite = ice_lite;
             }
+            if let Some(callee_srtp) = hints.callee_srtp.take() {
+                dialplan.media.callee_srtp = callee_srtp;
+            }
             // Custom SDP attribute pass-through: source and destination trunk
             // settings were already AND'd during hint merging; `None` keeps
             // the default (pass through).

@@ -988,6 +988,10 @@ pub struct MediaConfig {
     /// detection < per-trunk override. Defaults to false.
     #[serde(default)]
     pub ice_lite: bool,
+    /// Offer SDES-SRTP on non-WebRTC callee legs regardless of the caller
+    /// leg's transport (set from the destination trunk's `srtp = "sdes"`).
+    #[serde(default)]
+    pub callee_srtp: bool,
     /// Max seconds to wait for a WebRTC leg's ICE+DTLS before degrading the
     /// fast-path relay to transcoding. Unset = 5s default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1044,6 +1048,7 @@ impl MediaConfig {
             sip_contact: None,
             relay_only: false,
             ice_lite: false,
+            callee_srtp: false,
             relay_ready_timeout_secs: None,
             stall_detect_secs: None,
             media_trace_interval_secs: None,
@@ -1305,6 +1310,22 @@ impl std::fmt::Debug for Dialplan {
 }
 
 impl Dialplan {
+    /// Whether any target of this plan is a trunk that requires SDES-SRTP:
+    /// the routed media config (single target) or the hints of any
+    /// sequential attempt (failover). The media path is fixed when the call
+    /// starts, so it must be anchored from the start if a later attempt may
+    /// need to encrypt towards a trunk.
+    pub fn requires_callee_srtp(&self) -> bool {
+        self.media.callee_srtp
+            || matches!(
+                &self.flow,
+                DialplanFlow::Targets(DialStrategy::Sequential(attempts))
+                    if attempts.iter().any(|attempt| {
+                        attempt.hints.as_deref().and_then(|h| h.callee_srtp) == Some(true)
+                    })
+            )
+    }
+
     /// Build runtime options for a new routed attempt. The routing service has
     /// already run; its owner and call-lifetime permits stay on the original
     /// plan/session. Policy holds are shared for the normal teardown path.

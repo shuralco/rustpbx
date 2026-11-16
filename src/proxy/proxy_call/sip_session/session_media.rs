@@ -729,6 +729,20 @@ impl SipSession {
         force_regenerate: bool,
         callee_sdp_type: rustrtc::SdpType,
     ) -> Result<Option<String>> {
+        // A trunk with `srtp = "sdes"` must not fall back to plain RTP: an
+        // answer without RTP/SAVP + a=crypto fails this leg (502 to the
+        // caller, the callee dialog guard sends BYE) instead of a silent call.
+        if self.context.dialplan.media.callee_srtp
+            && let Some(sdp) = callee_sdp.as_deref()
+            && !(sdp.contains("RTP/SAVP") && sdp.contains("a=crypto:"))
+        {
+            warn!(session_id = %self.id,
+                session_id = %self.context.session_id,
+                reason = "callee_srtp_downgrade",
+                "Trunk requires SDES-SRTP but the callee answered without RTP/SAVP + a=crypto; rejecting the leg"
+            );
+            return Err(DownstreamMediaError(MediaNegotiationError::SrtpRequired.into()).into());
+        }
         // Apply the callee answer and prepare the caller SDP without committing it.
         if let Some(callee_sdp_value) = callee_sdp.as_ref() {
             let has_callee_leg = self.media_leg(&LegId::from("callee")).is_some();

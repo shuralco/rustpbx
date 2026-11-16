@@ -217,6 +217,12 @@ pub struct TrunkConfig {
     /// global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice_lite: Option<bool>,
+    /// Media encryption offered to this trunk. `sdes` always offers
+    /// `RTP/SAVP` with `a=crypto` on calls routed to the trunk, whatever the
+    /// caller leg uses (plain RTP, SDES or WebRTC/DTLS). Unset or `off` keeps
+    /// the default: SDES only when the caller itself arrived with SDES.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srtp: Option<TrunkSrtpMode>,
     /// Pass-through of custom (non-standard) SDP `a=` attributes across the
     /// B2BUA. Enabled by default (`None`/`true`): vendor-specific attributes
     /// from the peer's offer/answer are carried across the rewrite into the
@@ -614,6 +620,7 @@ impl Default for TrunkConfig {
             external_ip: None,
             bind_ip: None,
             ice_lite: None,
+            srtp: None,
             passthrough_custom_sdp_attrs: None,
             nat_fix: None,
             profile: None,
@@ -690,6 +697,16 @@ pub fn build_source_trunk(
         id: config.id,
         direction: config.direction,
     })
+}
+
+/// Media encryption policy for calls sent to a trunk (`[proxy.trunks.<name>] srtp`).
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TrunkSrtpMode {
+    /// Default behaviour: mirror SDES from the caller leg only.
+    Off,
+    /// Always offer SDES-SRTP (`RTP/SAVP` + `a=crypto`) to the trunk.
+    Sdes,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]

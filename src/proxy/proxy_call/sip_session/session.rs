@@ -1559,7 +1559,11 @@ impl SipSession {
             .map_err(|e| anyhow!("Failed to create server dialog: {}", e))?;
 
         let initial_plan = Self::initial_plan(&server, &context);
-        let use_media_proxy = Self::check_media_proxy(&context, &initial_plan.media.proxy_mode);
+        // A trunk that requires SDES needs our own media leg to encrypt
+        // towards it, so a plain caller cannot be passed through. The path is
+        // fixed for the whole call, so any attempt in the plan counts.
+        let use_media_proxy = Self::check_media_proxy(&context, &initial_plan.media.proxy_mode)
+            || context.dialplan.requires_callee_srtp();
 
         let (mut session, handle, cmd_rx) = SipSession::new(
             server.clone(),
@@ -6389,6 +6393,9 @@ impl SipSession {
         if let Some(ice_lite) = hints.ice_lite {
             plan.media.ice_lite = ice_lite;
         }
+        if let Some(callee_srtp) = hints.callee_srtp {
+            plan.media.callee_srtp = callee_srtp;
+        }
         if hints.disable_ice_servers == Some(true) {
             plan.media.ice_servers = None;
         }
@@ -8107,10 +8114,13 @@ impl SipSession {
     /// Transport mode for the callee (UAC) leg we generate an offer for. WebRTC
     /// callees are unchanged; for SIP callees we mirror SDES-SRTP from the caller
     /// leg ("secure in -> secure out") so anchored SIP<->SIP media stays
-    /// encrypted end to end. Plain-RTP callers keep plain `RTP/AVP`.
+    /// encrypted end to end. Plain-RTP callers keep plain `RTP/AVP`, unless the
+    /// destination trunk requires SDES (`srtp = "sdes"` → `media.callee_srtp`).
     pub(crate) fn callee_transport_mode(&self, callee_is_webrtc: bool) -> crate::media::TransportMode {
         if callee_is_webrtc {
             crate::media::TransportMode::WebRtc
+        } else if self.context.dialplan.media.callee_srtp {
+            crate::media::TransportMode::Srtp
         } else if self.caller_transport_mode() == crate::media::TransportMode::Srtp {
             crate::media::TransportMode::Srtp
         } else {

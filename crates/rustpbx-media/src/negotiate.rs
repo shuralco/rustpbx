@@ -9,6 +9,9 @@ pub enum MediaNegotiationError {
     MissingOffer,
     NoCompatibleCodecs,
     NoFreeVideoPayloadType,
+    /// The callee answered our SDES offer without `RTP/SAVP` + `a=crypto`
+    /// although its trunk requires SRTP.
+    SrtpRequired,
 }
 
 impl std::fmt::Display for MediaNegotiationError {
@@ -17,6 +20,9 @@ impl std::fmt::Display for MediaNegotiationError {
             Self::MissingOffer => f.write_str("No caller offer available"),
             Self::NoCompatibleCodecs => f.write_str("no codecs"),
             Self::NoFreeVideoPayloadType => f.write_str("no free dynamic video payload type"),
+            Self::SrtpRequired => {
+                f.write_str("callee answered without SDES-SRTP required by the trunk")
+            }
         }
     }
 }
