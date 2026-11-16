@@ -4081,6 +4081,18 @@ bucket = "default-recordings"
         assert_eq!(hint("plain"), None);
     }
 
+    /// Unknown `srtp` values are configuration errors, never a silent
+    /// fallback to `off` or `sdes`.
+    #[test]
+    fn test_trunk_srtp_rejects_unknown_values() {
+        for value in ["SDES", "dtls", "on", "garbage", ""] {
+            let raw = format!("[t]\ndest = \"sip:carrier.example.com\"\nsrtp = \"{value}\"\n");
+            let parsed: Result<HashMap<String, crate::proxy::routing::TrunkConfig>, _> =
+                toml::from_str(&raw);
+            assert!(parsed.is_err(), "srtp = {value:?} must be rejected, got {parsed:?}");
+        }
+    }
+
     /// Trunk-level override parsing: `ice_lite` is optional per trunk and
     /// serializes compactly (skipped) when absent.
     #[test]

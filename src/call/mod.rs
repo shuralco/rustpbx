@@ -1310,6 +1310,22 @@ impl std::fmt::Debug for Dialplan {
 }
 
 impl Dialplan {
+    /// Whether any target of this plan is a trunk that requires SDES-SRTP:
+    /// the routed media config (single target) or the hints of any
+    /// sequential attempt (failover). The media path is fixed when the call
+    /// starts, so it must be anchored from the start if a later attempt may
+    /// need to encrypt towards a trunk.
+    pub fn requires_callee_srtp(&self) -> bool {
+        self.media.callee_srtp
+            || matches!(
+                &self.flow,
+                DialplanFlow::Targets(DialStrategy::Sequential(attempts))
+                    if attempts.iter().any(|attempt| {
+                        attempt.hints.as_deref().and_then(|h| h.callee_srtp) == Some(true)
+                    })
+            )
+    }
+
     /// Build runtime options for a new routed attempt. The routing service has
     /// already run; its owner and call-lifetime permits stay on the original
     /// plan/session. Policy holds are shared for the normal teardown path.

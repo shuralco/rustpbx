@@ -1,7 +1,9 @@
 //! Per-trunk `srtp = "sdes"`: calls routed to the trunk always offer
 //! `RTP/SAVP` + `a=crypto`, whatever the caller leg uses (plain RTP or
 //! WebRTC/DTLS). Without the field the offer keeps the caller's profile
-//! (plain caller → `RTP/AVP`).
+//! (plain caller → `RTP/AVP`). A plain answer from such a trunk rejects the
+//! leg (502 to the caller, BYE to the trunk), and the value on the trunk a
+//! call ARRIVES from never applies to the callee leg.
 
 use anyhow::Result;
 use rustpbx::config::{MediaProxyMode, ProxyConfig};
@@ -12,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::common::e2e_test_server::E2eTestServer;
+use crate::common::e2e_test_server::{E2eTestServer, E2eTestServerInject};
 use crate::common::rtp_utils::RtpReceiver;
 use crate::common::test_helpers::make_sdp;
 use crate::common::test_ua::{TestUa, TestUaConfig, TestUaEvent};
@@ -45,25 +47,51 @@ enum Caller {
     WebRtc,
 }
 
-struct Outcome {
-    offer_to_trunk: String,
-    answer_to_caller: String,
+#[derive(Clone, Copy, Default)]
+struct Setup {
+    /// `srtp` of the destination trunk.
+    dest_srtp: Option<TrunkSrtpMode>,
+    /// The carrier answers with SDES (its own PeerConnection) or plain RTP/AVP.
+    carrier_sdes: bool,
+    /// Adds an inbound source trunk matching the caller, with this `srtp`.
+    source_srtp: Option<TrunkSrtpMode>,
 }
 
-/// Route `5100xxxxxx` to a trunk (`srtp` as given) and place one call from
-/// `caller`. The carrier is an SDES UA when the trunk requires SRTP, a plain
-/// UA otherwise; it answers through its own PeerConnection.
-async fn run_trunk_call(caller: Caller, srtp: Option<TrunkSrtpMode>) -> Result<Outcome> {
+struct Outcome {
+    offer_to_trunk: String,
+    /// Answer the caller got, or the call failure text.
+    answer_to_caller: Result<String, String>,
+    /// The carrier saw its answered dialog terminated by the PBX.
+    carrier_got_bye: bool,
+}
+
+/// Route `5100xxxxxx` to `carrier_trunk` and place one call from `caller`.
+async fn run_trunk_call(caller: Caller, setup: Setup) -> Result<Outcome> {
     let carrier_port = portpicker::pick_unused_port().unwrap_or(26300);
     let mut trunks = HashMap::new();
     trunks.insert(
         "carrier_trunk".to_string(),
         TrunkConfig {
             dest: format!("sip:127.0.0.1:{carrier_port}"),
-            srtp,
+            srtp: setup.dest_srtp,
             ..Default::default()
         },
     );
+    if let Some(srtp) = setup.source_srtp {
+        // Matches every local INVITE by IP; the explicit `id` pins it ahead
+        // of `carrier_trunk` in the inbound-trunk lookup.
+        trunks.insert(
+            "source_trunk".to_string(),
+            TrunkConfig {
+                dest: "sip:127.0.0.1:1".to_string(),
+                direction: Some(rustpbx::proxy::routing::TrunkDirection::Inbound),
+                inbound_hosts: vec!["127.0.0.1".to_string()],
+                srtp: Some(srtp),
+                id: Some(1),
+                ..Default::default()
+            },
+        );
+    }
     let routes = vec![RouteRule {
         name: "route_to_carrier".to_string(),
         priority: 1,
@@ -85,7 +113,17 @@ async fn run_trunk_call(caller: Caller, srtp: Option<TrunkSrtpMode>) -> Result<O
         routes: Some(routes),
         ..Default::default()
     };
-    let server = Arc::new(E2eTestServer::start_with_config(config).await?);
+    // The acl module resolves the inbound source trunk (`is_from_trunk_context`).
+    let server = Arc::new(
+        E2eTestServer::start_with_inject(
+            config,
+            E2eTestServerInject {
+                register_acl: setup.source_srtp.is_some(),
+                ..Default::default()
+            },
+        )
+        .await?,
+    );
 
     let carrier_config = TestUaConfig {
         webrtc: false,
@@ -99,7 +137,7 @@ async fn run_trunk_call(caller: Caller, srtp: Option<TrunkSrtpMode>) -> Result<O
         rustrtc::config::AudioCapability::pcmu(),
         rustrtc::config::AudioCapability::telephone_event(),
     ];
-    let mut carrier = if srtp == Some(TrunkSrtpMode::Sdes) {
+    let mut carrier = if setup.carrier_sdes {
         TestUa::new_srtp_with_caps(carrier_config, pcmu.clone())
     } else {
         TestUa::new(carrier_config)
@@ -147,28 +185,50 @@ async fn run_trunk_call(caller: Caller, srtp: Option<TrunkSrtpMode>) -> Result<O
     .await
     .expect("carrier should receive the call routed to the trunk")?;
     let offer_to_trunk = offer_to_trunk.expect("INVITE to the trunk should carry SDP");
-    let carrier_answer = if srtp == Some(TrunkSrtpMode::Sdes) {
+    let carrier_receiver = RtpReceiver::bind(0).await?;
+    let carrier_answer = if setup.carrier_sdes {
         None // the SDES PeerConnection answers the crypto offer itself
     } else {
-        Some(make_sdp(RtpReceiver::bind(0).await?.port()?))
+        Some(make_sdp(carrier_receiver.port()?))
     };
-    carrier.answer_call(&carrier_dialog_id, carrier_answer).await?;
+    carrier
+        .answer_call(&carrier_dialog_id, carrier_answer)
+        .await?;
 
-    let dialog_id = tokio::time::timeout(Duration::from_secs(20), call).await???;
-    let answer_to_caller = wait_for_value(Duration::from_secs(5), || {
-        caller_ua.get_negotiated_answer_sdp(&dialog_id)
-    })
-    .await
-    .expect("caller should receive the 200 OK answer");
-    if srtp == Some(TrunkSrtpMode::Sdes) {
-        // SDES keys from the 200 OK armed the carrier's SRTP transport.
-        carrier.wait_webrtc_connected(Duration::from_secs(10)).await?;
-    }
-    caller_ua.hangup(&dialog_id).await?;
+    let answer_to_caller = match tokio::time::timeout(Duration::from_secs(20), call).await?? {
+        Ok(dialog_id) => {
+            let answer = wait_for_value(Duration::from_secs(5), || {
+                caller_ua.get_negotiated_answer_sdp(&dialog_id)
+            })
+            .await
+            .expect("caller should receive the 200 OK answer");
+            if setup.carrier_sdes {
+                // SDES keys from the 200 OK armed the carrier's SRTP transport.
+                carrier
+                    .wait_webrtc_connected(Duration::from_secs(10))
+                    .await?;
+            }
+            caller_ua.hangup(&dialog_id).await?;
+            Ok(answer)
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    let carrier_got_bye = answer_to_caller.is_err()
+        && wait_for_value(Duration::from_secs(5), || async {
+            carrier.process_dialog_events().await.ok().and_then(|events| {
+                events
+                    .into_iter()
+                    .any(|e| matches!(e, TestUaEvent::CallTerminated(id) if id == carrier_dialog_id))
+                    .then_some(())
+            })
+        })
+        .await
+        .is_ok();
     server.stop();
     Ok(Outcome {
         offer_to_trunk,
         answer_to_caller,
+        carrier_got_bye,
     })
 }
 
@@ -184,18 +244,34 @@ fn assert_sdes_offer(outcome: &Outcome) {
     );
 }
 
+fn assert_plain_offer(outcome: &Outcome) {
+    let offer = &outcome.offer_to_trunk;
+    assert!(
+        offer.contains("RTP/AVP") && !offer.contains("RTP/SAVP") && !offer.contains("a=crypto:"),
+        "the trunk offer must stay plain RTP/AVP:\n{offer}"
+    );
+}
+
+const SDES_TRUNK: Setup = Setup {
+    dest_srtp: Some(TrunkSrtpMode::Sdes),
+    carrier_sdes: true,
+    source_srtp: None,
+};
+
 #[test]
 fn trunk_srtp_sdes_plain_caller_offers_savp() {
     run_with_big_stack(async {
         let _guard = SCENARIO_LOCK.lock().await;
-        let outcome = run_trunk_call(Caller::PlainRtp, Some(TrunkSrtpMode::Sdes)).await?;
+        let outcome = run_trunk_call(Caller::PlainRtp, SDES_TRUNK).await?;
         assert_sdes_offer(&outcome);
         // The caller leg keeps its own (plain) profile.
+        let answer = outcome
+            .answer_to_caller
+            .as_ref()
+            .expect("call must connect");
         assert!(
-            outcome.answer_to_caller.contains("RTP/AVP")
-                && !outcome.answer_to_caller.contains("a=crypto:"),
-            "plain caller must get a plain RTP/AVP answer:\n{}",
-            outcome.answer_to_caller
+            answer.contains("RTP/AVP") && !answer.contains("a=crypto:"),
+            "plain caller must get a plain RTP/AVP answer:\n{answer}"
         );
         Ok(())
     });
@@ -205,12 +281,15 @@ fn trunk_srtp_sdes_plain_caller_offers_savp() {
 fn trunk_srtp_sdes_webrtc_caller_offers_savp() {
     run_with_big_stack(async {
         let _guard = SCENARIO_LOCK.lock().await;
-        let outcome = run_trunk_call(Caller::WebRtc, Some(TrunkSrtpMode::Sdes)).await?;
+        let outcome = run_trunk_call(Caller::WebRtc, SDES_TRUNK).await?;
         assert_sdes_offer(&outcome);
+        let answer = outcome
+            .answer_to_caller
+            .as_ref()
+            .expect("call must connect");
         assert!(
-            outcome.answer_to_caller.contains("a=fingerprint"),
-            "WebRTC caller must still get a DTLS answer:\n{}",
-            outcome.answer_to_caller
+            answer.contains("a=fingerprint"),
+            "WebRTC caller must still get a DTLS answer:\n{answer}"
         );
         Ok(())
     });
@@ -220,11 +299,65 @@ fn trunk_srtp_sdes_webrtc_caller_offers_savp() {
 fn trunk_srtp_sdes_unset_keeps_plain_offer() {
     run_with_big_stack(async {
         let _guard = SCENARIO_LOCK.lock().await;
-        let outcome = run_trunk_call(Caller::PlainRtp, None).await?;
-        let offer = &outcome.offer_to_trunk;
+        let outcome = run_trunk_call(Caller::PlainRtp, Setup::default()).await?;
+        assert_plain_offer(&outcome);
         assert!(
-            offer.contains("RTP/AVP") && !offer.contains("RTP/SAVP") && !offer.contains("a=crypto:"),
-            "without srtp the trunk offer must stay plain RTP/AVP:\n{offer}"
+            outcome.answer_to_caller.is_ok(),
+            "plain trunk call must connect"
+        );
+        Ok(())
+    });
+}
+
+/// A trunk that requires SDES answering plain RTP/AVP: the leg is rejected
+/// (502 to the caller, BYE to the trunk) instead of a call without audio.
+#[test]
+fn trunk_srtp_sdes_plain_answer_rejects_leg() {
+    run_with_big_stack(async {
+        let _guard = SCENARIO_LOCK.lock().await;
+        let outcome = run_trunk_call(
+            Caller::PlainRtp,
+            Setup {
+                carrier_sdes: false,
+                ..SDES_TRUNK
+            },
+        )
+        .await?;
+        assert_sdes_offer(&outcome);
+        let failure = outcome
+            .answer_to_caller
+            .as_ref()
+            .expect_err("a plain answer from an srtp=sdes trunk must fail the call");
+        assert!(
+            failure.contains("502"),
+            "caller must get 502, got: {failure}"
+        );
+        assert!(
+            outcome.carrier_got_bye,
+            "the answered trunk leg must be torn down"
+        );
+        Ok(())
+    });
+}
+
+/// `srtp = "sdes"` on the trunk the call ARRIVES from governs what we send to
+/// that trunk, not the callee leg: the offer to a plain trunk stays RTP/AVP.
+#[test]
+fn trunk_srtp_sdes_source_trunk_does_not_apply_to_callee() {
+    run_with_big_stack(async {
+        let _guard = SCENARIO_LOCK.lock().await;
+        let outcome = run_trunk_call(
+            Caller::PlainRtp,
+            Setup {
+                source_srtp: Some(TrunkSrtpMode::Sdes),
+                ..Setup::default()
+            },
+        )
+        .await?;
+        assert_plain_offer(&outcome);
+        assert!(
+            outcome.answer_to_caller.is_ok(),
+            "plain trunk call must connect"
         );
         Ok(())
     });

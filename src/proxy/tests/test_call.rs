@@ -554,6 +554,68 @@ async fn default_resolve_preserves_retry_invites_hints_and_policies() {
     assert!(empty.is_empty(), "an empty Forward must not fall back to direct dialing");
 }
 
+/// Failover "plain target first, then an `srtp = "sdes"` trunk": the routed
+/// plan has no `callee_srtp` at the call level and the first attempt is plain,
+/// yet the plan must still demand an anchored media path from the start,
+/// because the media path cannot change once the call is dialing.
+#[tokio::test]
+async fn default_resolve_failover_to_srtp_trunk_requires_callee_srtp() {
+    struct FailoverRouter(bool);
+    #[async_trait]
+    impl RouteInvite for FailoverRouter {
+        async fn route_invite(
+            &self, _option: InviteOption, _origin: &rsipstack::sip::Request,
+            _direction: &DialDirection, _cookie: &TransactionCookie,
+        ) -> Result<RouteResult> {
+            let srtp_trunk = crate::proxy::routing::TrunkConfig {
+                dest: "sip:carrier.example.com".to_string(),
+                srtp: self.0.then_some(crate::proxy::routing::TrunkSrtpMode::Sdes),
+                ..Default::default()
+            };
+            let mut trunk_hints = None;
+            crate::proxy::routing::matcher::merge_trunk_media_hints(&mut trunk_hints, &srtp_trunk);
+            Ok(RouteResult::Forward(vec![
+                crate::config::RouteTarget {
+                    option: InviteOption {
+                        callee: "sip:desk@pbx.example.com".try_into().unwrap(),
+                        ..Default::default()
+                    },
+                    hints: Some(Default::default()),
+                    retry_policy: Some(crate::proxy::routing::RetryPolicy { status_codes: vec![480] }),
+                },
+                crate::config::RouteTarget {
+                    option: InviteOption {
+                        callee: "sip:5100000001@carrier.example.com".try_into().unwrap(),
+                        ..Default::default()
+                    },
+                    hints: trunk_hints,
+                    retry_policy: None,
+                },
+            ]))
+        }
+    }
+    let (server, config) = create_test_server().await;
+    let module = CallModule::new(config, server);
+    let request = crate::proxy::tests::common::create_test_request(
+        rsipstack::sip::Method::Invite, "bp", None, "rustpbx.com", None,
+    );
+    let caller = SipUser { username: "bp".into(), realm: Some("rustpbx.com".into()), ..Default::default() };
+    let plan = module.default_resolve(
+        &request, Box::new(FailoverRouter(true)), &caller, &TransactionCookie::default(),
+    ).await.unwrap();
+    let crate::call::DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = &plan.flow else {
+        panic!("expected a sequential failover plan");
+    };
+    assert_eq!(attempts.len(), 2);
+    assert!(!plan.media.callee_srtp, "the first (plain) attempt must not carry the trunk flag");
+    assert!(plan.requires_callee_srtp(), "a later srtp=sdes trunk attempt must anchor the call");
+
+    let plain = module.default_resolve(
+        &request, Box::new(FailoverRouter(false)), &caller, &TransactionCookie::default(),
+    ).await.unwrap();
+    assert!(!plain.requires_callee_srtp(), "without srtp on any target nothing changes");
+}
+
 #[tokio::test]
 async fn default_resolve_fixes_call_settings_from_the_first_of_several_targets() {
     struct TwoTrunks;
