@@ -2242,6 +2242,10 @@ pub struct DialplanHints {
     /// console `metadata.sbc.ice_lite`). `Some(true)` forces `a=ice-lite` on
     /// this session's plain-RTP legs; `Some(false)` explicitly disables it.
     pub ice_lite: Option<bool>,
+    /// Destination-trunk SRTP requirement (from `[proxy.trunks.<name>] srtp`).
+    /// `Some(true)` makes non-WebRTC callee legs offer SDES-SRTP even when the
+    /// caller leg is plain RTP or WebRTC. Never taken from the source trunk.
+    pub callee_srtp: Option<bool>,
     /// Custom SDP attribute pass-through gate (from
     /// `[proxy.trunks.<name>] passthrough_custom_sdp_attrs` or the console
     /// `metadata.sbc.passthrough_custom_sdp_attrs`). `None`/`true` keeps
@@ -2284,6 +2288,7 @@ impl std::fmt::Debug for DialplanHints {
             .field("external_ip", &self.external_ip)
             .field("bind_ip", &self.bind_ip)
             .field("ice_lite", &self.ice_lite)
+            .field("callee_srtp", &self.callee_srtp)
             .field(
                 "passthrough_custom_sdp_attrs",
                 &self.passthrough_custom_sdp_attrs,
@@ -4043,6 +4048,37 @@ bucket = "default-recordings"
         )
         .unwrap();
         assert_eq!(config.cdr_rollup_interval, 0);
+    }
+
+    /// `srtp` per trunk: `sdes`/`off` parse, absent stays `None` and is not
+    /// serialized; `sdes` becomes the destination-trunk `callee_srtp` hint.
+    #[test]
+    fn test_trunk_srtp_parsing() {
+        use crate::proxy::routing::TrunkSrtpMode;
+        let raw = r#"
+            [secure]
+            dest = "sip:carrier.example.com:5061"
+            srtp = "sdes"
+            [off]
+            dest = "sip:carrier.example.com"
+            srtp = "off"
+            [plain]
+            dest = "sip:carrier.example.com"
+        "#;
+        let trunks: HashMap<String, crate::proxy::routing::TrunkConfig> =
+            toml::from_str(raw).unwrap();
+        assert_eq!(trunks["secure"].srtp, Some(TrunkSrtpMode::Sdes));
+        assert_eq!(trunks["off"].srtp, Some(TrunkSrtpMode::Off));
+        assert_eq!(trunks["plain"].srtp, None);
+        assert!(!toml::to_string(&trunks["plain"]).unwrap().contains("srtp"));
+        let hint = |name: &str| {
+            let mut hints = None;
+            crate::proxy::routing::matcher::merge_trunk_media_hints(&mut hints, &trunks[name]);
+            hints.and_then(|h| h.callee_srtp)
+        };
+        assert_eq!(hint("secure"), Some(true));
+        assert_eq!(hint("off"), Some(false));
+        assert_eq!(hint("plain"), None);
     }
 
     /// Trunk-level override parsing: `ice_lite` is optional per trunk and

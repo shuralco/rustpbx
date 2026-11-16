@@ -735,6 +735,7 @@ fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkCon
             .and_then(|meta| meta.get("sbc"))
             .and_then(|sbc| sbc.get("ice_lite"))
             .and_then(|v| v.as_bool()),
+        srtp: None,
         passthrough_custom_sdp_attrs: model
             .metadata
             .as_ref()

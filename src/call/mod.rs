@@ -988,6 +988,10 @@ pub struct MediaConfig {
     /// detection < per-trunk override. Defaults to false.
     #[serde(default)]
     pub ice_lite: bool,
+    /// Offer SDES-SRTP on non-WebRTC callee legs regardless of the caller
+    /// leg's transport (set from the destination trunk's `srtp = "sdes"`).
+    #[serde(default)]
+    pub callee_srtp: bool,
     /// Max seconds to wait for a WebRTC leg's ICE+DTLS before degrading the
     /// fast-path relay to transcoding. Unset = 5s default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1044,6 +1048,7 @@ impl MediaConfig {
             sip_contact: None,
             relay_only: false,
             ice_lite: false,
+            callee_srtp: false,
             relay_ready_timeout_secs: None,
             stall_detect_secs: None,
             media_trace_interval_secs: None,

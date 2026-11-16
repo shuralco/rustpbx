@@ -223,6 +223,9 @@ async fn match_invite_impl(
             hints.network_profile_id = None;
             hints.external_ip = None;
             hints.bind_ip = None;
+            // The source trunk's SRTP policy governs what we send to it,
+            // not the callee leg of a call arriving from it.
+            hints.callee_srtp = None;
         }
     }
 
@@ -1556,6 +1559,7 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
         && trunk.external_ip.is_none()
         && trunk.bind_ip.is_none()
         && trunk.ice_lite.is_none()
+        && trunk.srtp.is_none()
         && trunk.passthrough_custom_sdp_attrs.is_none()
         && trunk.profile.is_none()
         && trunk.diversion_headers.is_none()
@@ -1611,6 +1615,9 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
     }
     if let Some(ice_lite) = trunk.ice_lite {
         hints.ice_lite = Some(ice_lite);
+    }
+    if let Some(srtp) = trunk.srtp {
+        hints.callee_srtp = Some(srtp == crate::proxy::routing::TrunkSrtpMode::Sdes);
     }
     // Custom SDP attribute pass-through: source and destination trunks both
     // merge here, so the semantics are AND — a single disabled trunk strips
